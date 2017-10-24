@@ -2,17 +2,21 @@ package main
 
 import (
 	"archive/tar"
+	"bytes"
 	"compress/gzip"
-	"fmt"
 	"io"
+	"io/ioutil"
 	"os"
 	"path/filepath"
-	"io/ioutil"
-	"bytes"
 	"time"
 
+	"fmt"
+	"strings"
+
+	"github.com/appscode/go-term"
 	"github.com/ghodss/yaml"
 	"github.com/golang/glog"
+	"github.com/tamalsaha/go-oneliners"
 	core "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/discovery"
@@ -20,14 +24,12 @@ import (
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
-	"github.com/tamalsaha/go-oneliners"
 )
 
 // ref: https://gist.github.com/jonmorehouse/9060515
 const (
 	TimestampFormat = "20060102T150405"
 )
-
 
 func main() {
 	masterURL := ""
@@ -38,13 +40,16 @@ func main() {
 		glog.Fatalf("Could not get Kubernetes config: %s", err)
 	}
 
-	opts := BackupManager{
+	mgr := BackupManager{
 		config: config,
 		//cluster:   "minikube",
-		//backupDir: "/home/tamal/go/src/github.com/tamalsaha/tb",
-		sanitize: true,
+		backupDir: "/home/tamal/go/src/github.com/tamalsaha/tb",
+		sanitize:  true,
 	}
-	err = opts.BackupToDir("/home/tamal/go/src/github.com/tamalsaha/tb")
+
+	// opts.getAndWriteAllObjectsFromCluster(config)
+
+	err = mgr.BackupToTar("/home/tamal/go/src/github.com/tamalsaha/tb")
 	oneliners.FILE(err)
 }
 
@@ -91,7 +96,7 @@ func (mgr BackupManager) BackupToTar(backupDir string) error {
 	t := time.Now()
 	prefix := mgr.snapshotPrefix(t)
 
-	file, err := os.Create(prefix + ".tar.gz")
+	file, err := os.Create(filepath.Join(backupDir, prefix+".tar.gz"))
 	if err != nil {
 		return err
 	}
@@ -149,11 +154,19 @@ func (mgr BackupManager) Backup(process ProcessorFunc) error {
 	}
 
 	for _, list := range resourceLists {
+		gv, err := schema.ParseGroupVersion(list.GroupVersion)
+		if err != nil {
+			return err
+		}
 		for _, r := range list.APIResources {
-			glog.V(3).Infof("Taking backup of %s apiVersion:%s kind:%s", list.GroupVersion, r.Name)
-			mgr.config.GroupVersion = &schema.GroupVersion{Group: r.Group, Version: r.Version}
+			if strings.ContainsRune(r.Name, '/') {
+				continue
+			}
+			oneliners.FILE("Taking backup of %s apiVersion:", list.GroupVersion, " | kind:", r.Name, "|", r.Group, "|", r.Version)
+			glog.V(3).Infof("Taking backup of %s apiVersion:%s kind:%s", list.GroupVersion, r.Name, r.Group, r.Version)
+			mgr.config.GroupVersion = &gv
 			mgr.config.APIPath = "/apis"
-			if r.Group == core.GroupName {
+			if gv.Group == core.GroupName {
 				mgr.config.APIPath = "/api"
 			}
 			client, err := rest.RESTClientFor(mgr.config)
@@ -163,7 +176,8 @@ func (mgr BackupManager) Backup(process ProcessorFunc) error {
 			request := client.Get().Resource(r.Name).Param("pretty", "true")
 			resp, err := request.DoRaw()
 			if err != nil {
-				return err
+				glog.Errorln(err)
+				continue
 			}
 			items := &ItemList{}
 			err = yaml.Unmarshal(resp, &items)
@@ -175,17 +189,19 @@ func (mgr BackupManager) Backup(process ProcessorFunc) error {
 				item["apiVersion"] = list.GroupVersion
 				item["kind"] = r.Kind
 
-				if md, ok := item["metadata"]; ok {
+				md, ok := item["metadata"]
+				if ok {
 					path = getPathFromSelfLink(md)
 					if mgr.sanitize {
 						cleanUpObjectMeta(md)
 					}
 				}
+				oneliners.FILE(path)
 				if mgr.sanitize {
 					if spec, ok := item["spec"].(map[string]interface{}); ok {
 						switch r.Kind {
 						case "Pod":
-							spec, err = cleanUpPodSpec(spec)
+							item["spec"], err = cleanUpPodSpec(spec)
 							if err != nil {
 								return err
 							}
@@ -204,11 +220,11 @@ func (mgr BackupManager) Backup(process ProcessorFunc) error {
 					}
 					delete(item, "status")
 				}
-				bytes, err := yaml.Marshal(item)
+				data, err := yaml.Marshal(item)
 				if err != nil {
 					return err
 				}
-				err = process(path, bytes)
+				err = process(path, data)
 				if err != nil {
 					return err
 				}
@@ -243,6 +259,7 @@ func cleanUpDecorators(m map[string]string) {
 	delete(m, "controller-uid")
 	delete(m, "deployment.kubernetes.io/desired-replicas")
 	delete(m, "deployment.kubernetes.io/max-replicas")
+	delete(m, "deployment.kubernetes.io/revision")
 	delete(m, "deployment.kubernetes.io/revision")
 	delete(m, "pod-template-hash")
 	delete(m, "pv.kubernetes.io/bind-completed")
@@ -285,7 +302,133 @@ func cleanUpPodSpec(in map[string]interface{}) (map[string]interface{}, error) {
 func getPathFromSelfLink(md interface{}) string {
 	meta, ok := md.(map[string]interface{})
 	if ok {
-		return fmt.Sprintf("%s.yaml", meta["selfLink"])
+		return meta["selfLink"].(string) + ".yaml"
+	}
+	return ""
+}
+
+func (backup BackupManager) getAndWriteAllObjectsFromCluster(kubeConfig *rest.Config) {
+	discoveryClient := discovery.NewDiscoveryClientForConfigOrDie(kubeConfig)
+	rs, err := discoveryClient.ServerResources()
+	if err != nil {
+		term.Fatalln(err)
+	}
+
+	err = os.MkdirAll(backup.backupDir, 0755)
+	if err != nil {
+		term.Fatalln(err)
+	}
+	resBytes, err := yaml.Marshal(rs)
+	if err != nil {
+		term.Fatalln(err)
+	}
+	err = ioutil.WriteFile(filepath.Join(backup.backupDir, "api_resources.yaml"), resBytes, 0755)
+	if err != nil {
+		term.Fatalln(err)
+	}
+
+	for _, v := range rs {
+		gv, err := schema.ParseGroupVersion(v.GroupVersion)
+		if err != nil {
+			continue
+		}
+		for _, rss := range v.APIResources {
+			if strings.ContainsRune(rss.Name, '/') {
+				continue
+			}
+
+			term.Infoln("Taking backup for", rss.Name, "groupversion =", v.GroupVersion)
+			if err := rest.SetKubernetesDefaults(kubeConfig); err != nil {
+				term.Fatalln(err)
+			}
+			kubeConfig.ContentConfig = dynamic.ContentConfig()
+			kubeConfig.GroupVersion = &schema.GroupVersion{Group: gv.Group, Version: gv.Version}
+			kubeConfig.APIPath = "/apis"
+			if gv.Group == core.GroupName {
+				kubeConfig.APIPath = "/api"
+			}
+			restClient, err := rest.RESTClientFor(kubeConfig)
+			if err != nil {
+				term.Fatalln(err)
+			}
+			request := restClient.Get().Resource(rss.Name).Param("pretty", "true")
+			b, err := request.DoRaw()
+			if err != nil {
+				oneliners.FILE("---------------------------")
+				term.Errorln(err)
+				continue
+			}
+			list := &ItemList{}
+			err = yaml.Unmarshal(b, &list)
+			if err != nil {
+				oneliners.FILE("---------------------------")
+				term.Errorln(err)
+				continue
+			}
+			if len(list.Items) > 1000 {
+				ok := term.Ask(fmt.Sprintf("Too many objects (%v). Want to take backup ?", len(list.Items)), true)
+				if !ok {
+					continue
+				}
+			}
+			for _, ob := range list.Items {
+				var selfLink string
+				ob["apiVersion"] = v.GroupVersion
+				ob["kind"] = rss.Kind
+				i, ok := ob["metadata"]
+				if ok {
+					selfLink = getSelfLinkFromMetadata(i)
+				} else {
+					term.Errorln("Metadata not found")
+					continue
+				}
+				if backup.sanitize {
+					cleanUpObjectMeta(i)
+					spec, ok := ob["spec"].(map[string]interface{})
+					if ok {
+						if rss.Kind == "Pod" {
+							spec, _ = cleanUpPodSpec(spec)
+						}
+						template, ok := spec["template"].(map[string]interface{})
+						if ok {
+							podSpec, ok := template["spec"].(map[string]interface{})
+							if ok {
+								template["spec"], _ = cleanUpPodSpec(podSpec)
+							}
+						}
+					}
+					delete(ob, "status")
+				}
+				b, err := yaml.Marshal(ob)
+				if err != nil {
+					oneliners.FILE("---------------------------")
+					term.Errorln(err)
+					break
+				}
+				path := filepath.Dir(filepath.Join(backup.backupDir, selfLink))
+				obName := filepath.Base(selfLink)
+				err = os.MkdirAll(path, 0777)
+				if err != nil {
+					oneliners.FILE("---------------------------")
+					term.Errorln(err)
+					break
+				}
+				fileName := filepath.Join(path, obName+".yaml")
+				if err = ioutil.WriteFile(fileName, b, 0644); err != nil {
+					oneliners.FILE("---------------------------")
+					term.Errorln(err)
+					continue
+				}
+
+			}
+		}
+	}
+}
+
+func getSelfLinkFromMetadata(i interface{}) string {
+	meta, ok := i.(map[string]interface{})
+	if ok {
+		return meta["selfLink"].(string)
 	}
 	return ""
 }
